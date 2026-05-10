@@ -1,0 +1,9 @@
+[keys.kagi]
+ref = "op://Private/kagi.com/api_key"
+env = "KAGI_KEY"
+
+[keys.github_token]
+ref = "op://Personal/GitHub PAT/credential"
+
+[keys.openai]
+ref = "op://Private/OpenAI/api_key"
