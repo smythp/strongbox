@@ -288,7 +288,7 @@ def _op_read(ref: str) -> str:
     return result.stdout.rstrip("\n")
 
 
-def _load_manifest() -> tuple[dict[str, dict[str, str]], Path, bool]:
+def _load_manifest() -> tuple[dict[str, dict[str, str | bool]], Path, bool]:
     path = _manifest_path()
     if not path.exists():
         return {}, path, False
@@ -298,16 +298,11 @@ def _load_manifest() -> tuple[dict[str, dict[str, str]], Path, bool]:
     except OSError as e:
         raise SystemExit(f"manifest: cannot read {path}: {e}")
     except tomllib.TOMLDecodeError as e:
-        detail = str(e)
-        if "line " not in detail:
-            line = text.count("\n") + 1
-            column = len(text.rsplit("\n", 1)[-1]) + 1
-            detail = f"{detail} (at line {line}, column {column})"
-        raise SystemExit(f"manifest: parse error in {path}: {detail}")
+        raise SystemExit(f"manifest: parse error in {path}: {e}")
     keys = data.get("keys", {})
     if not isinstance(keys, dict):
         raise SystemExit(f"manifest: invalid schema in {path}: 'keys' must be a table")
-    entries: dict[str, dict[str, str]] = {}
+    entries: dict[str, dict[str, str | bool]] = {}
     for name in sorted(keys):
         entry = keys[name]
         if not MANIFEST_NAME_RE.fullmatch(name):
@@ -316,21 +311,32 @@ def _load_manifest() -> tuple[dict[str, dict[str, str]], Path, bool]:
             )
         if not isinstance(entry, dict):
             raise SystemExit(f"manifest: invalid entry for {name!r} in {path}; expected a table")
+        if any(isinstance(value, dict) for value in entry.values()):
+            nested_name = next(subkey for subkey, value in entry.items() if isinstance(value, dict))
+            raise SystemExit(
+                f"manifest: [keys.{name}.{nested_name}] is a nested table; "
+                "flatten to a single [keys.<name>] entry"
+            )
         ref = entry.get("ref")
         if not isinstance(ref, str) or not ref:
             raise SystemExit(f"manifest: key {name!r} in {path} must define a string 'ref'")
+        env_explicit = "env" in entry
         env = entry.get("env")
-        if env is not None:
+        if env_explicit:
             if not isinstance(env, str) or not ENV_NAME_RE.fullmatch(env):
                 raise SystemExit(
                     f"manifest: key {name!r} in {path} has invalid env {env!r}; "
                     "expected [A-Z_][A-Z0-9_]*"
                 )
-        entries[name] = {"ref": ref, "env": env or name.upper()}
+        entries[name] = {
+            "ref": ref,
+            "env": env if env_explicit else name.upper(),
+            "env_explicit": env_explicit,
+        }
     return entries, path, True
 
 
-def _known_names(entries: dict[str, dict[str, str]]) -> str:
+def _known_names(entries: dict[str, dict[str, str | bool]]) -> str:
     if not entries:
         return "(none)"
     return ", ".join(sorted(entries))
@@ -430,7 +436,7 @@ def manifest() -> int:
     for name in sorted(entries):
         entry = entries[name]
         line = f"{name} → {entry['ref']}"
-        if entry["env"] != name.upper():
+        if entry["env_explicit"]:
             line += f" → {entry['env']}"
         print(line)
     return 0

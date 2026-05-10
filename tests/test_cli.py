@@ -213,7 +213,8 @@ class CliTests(unittest.TestCase):
     def test_manifest_lists_entries_and_env_overrides(self):
         self.write_manifest(
             '[keys.github_token]\nref = "op://Personal/GitHub PAT/credential"\n\n'
-            '[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "KAGI_KEY"\n'
+            '[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "KAGI"\n\n'
+            '[keys.openai]\nref = "op://Private/openai/api_key"\nenv = "OPENAI_KEY"\n'
         )
         out = io.StringIO()
         with redirect_stdout(out):
@@ -222,7 +223,8 @@ class CliTests(unittest.TestCase):
             out.getvalue().splitlines(),
             [
                 "github_token → op://Personal/GitHub PAT/credential",
-                "kagi → op://Private/kagi.com/api_key → KAGI_KEY",
+                "kagi → op://Private/kagi.com/api_key → KAGI",
+                "openai → op://Private/openai/api_key → OPENAI_KEY",
             ],
         )
 
@@ -245,7 +247,7 @@ class CliTests(unittest.TestCase):
             self.module.main(["manifest"])
         self.assertNotEqual(ctx.exception.code, 0)
         self.assertIn("parse error", str(ctx.exception))
-        self.assertIn("line 4, column 1", str(ctx.exception))
+        self.assertIn("Invalid value", str(ctx.exception))
 
     def test_invalid_manifest_name_is_rejected(self):
         self.write_manifest('[keys.Kagi]\nref = "op://Private/kagi.com/api_key"\n')
@@ -265,11 +267,23 @@ class CliTests(unittest.TestCase):
             self.module.main(["manifest"])
         self.assertIn("invalid env '1KAGI'", str(ctx.exception))
 
+    def test_invalid_manifest_env_with_hyphen_is_rejected(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "KAGI-KEY"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("invalid env 'KAGI-KEY'", str(ctx.exception))
+
     def test_manifest_entry_requires_ref(self):
         self.write_manifest('[keys.kagi]\nenv = "KAGI_KEY"\n')
         with self.assertRaises(SystemExit) as ctx:
             self.module.main(["manifest"])
         self.assertIn("must define a string 'ref'", str(ctx.exception))
+
+    def test_nested_manifest_table_is_rejected_with_clear_error(self):
+        self.write_manifest('[keys.foo.bar]\nref = "op://Private/foo/bar"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("[keys.foo.bar] is a nested table", str(ctx.exception))
 
     def test_revoke_all_removes_cache_dir(self):
         self.module._save_cached("op://a/b/c", "secret")
