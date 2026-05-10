@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -18,14 +19,21 @@ class CliTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.module = load_strongbox()
+        self.manifest_path = Path(self.tmp.name) / "manifest.toml"
         self.env = patch.dict(
             os.environ,
-            {"STRONGBOX_CACHE_DIR": self.tmp.name},
+            {
+                "STRONGBOX_CACHE_DIR": self.tmp.name,
+                "STRONGBOX_MANIFEST": str(self.manifest_path),
+            },
             clear=False,
         )
         self.env.start()
         os.environ.pop("STRONGBOX_OP_TIMEOUT", None)
         self.addCleanup(self.env.stop)
+
+    def write_manifest(self, contents: str) -> None:
+        self.manifest_path.write_text(contents, encoding="utf-8")
 
     def test_missing_subcommand(self):
         err = io.StringIO()
@@ -98,6 +106,154 @@ class CliTests(unittest.TestCase):
         ) as run_mock, redirect_stdout(out):
             self.assertEqual(self.module.main(["read", "op://a/b/c"]), 0)
         self.assertIsNone(run_mock.call_args.kwargs["timeout"])
+
+    def test_read_manifest_name_resolves_via_op(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\n')
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", return_value=cp) as run_mock, redirect_stdout(out):
+            self.assertEqual(self.module.main(["read", "kagi"]), 0)
+        self.assertEqual(out.getvalue(), "secret\n")
+        self.assertEqual(run_mock.call_args.args[0], ["op", "read", "op://Private/kagi.com/api_key"])
+
+    def test_read_direct_ref_still_works_unchanged(self):
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", return_value=cp) as run_mock, redirect_stdout(out):
+            self.assertEqual(self.module.main(["read", "op://a/b/c"]), 0)
+        self.assertEqual(out.getvalue(), "secret\n")
+        self.assertEqual(run_mock.call_args.args[0], ["op", "read", "op://a/b/c"])
+
+    def test_read_unknown_manifest_name_lists_known_names(self):
+        self.write_manifest(
+            '[keys.kagi]\nref = "op://Private/kagi.com/api_key"\n\n'
+            '[keys.github_token]\nref = "op://Personal/GitHub PAT/credential"\n'
+        )
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stderr(err):
+            self.module.main(["read", "openai"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("unknown manifest name 'openai'", err.getvalue())
+        self.assertIn("known names: github_token, kagi", err.getvalue())
+
+    def test_read_name_with_no_manifest_file_mentions_missing_manifest(self):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stderr(err):
+            self.module.main(["read", "kagi"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn(f"no manifest at {self.manifest_path}", err.getvalue())
+
+    def test_load_emits_shell_quoted_exports(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\n')
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "s p'ace\n", "")
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", return_value=cp), redirect_stdout(out):
+            self.assertEqual(self.module.main(["load", "kagi"]), 0)
+        expected = shlex.quote("s p'ace")
+        self.assertEqual(out.getvalue(), f"export KAGI={expected}\n")
+
+    def test_load_uses_env_override(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "KAGI_KEY"\n')
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", return_value=cp), redirect_stdout(out):
+            self.assertEqual(self.module.main(["load", "kagi"]), 0)
+        self.assertEqual(out.getvalue(), "export KAGI_KEY=secret\n")
+
+    def test_load_defaults_env_to_uppercase_name(self):
+        self.write_manifest('[keys.github_token]\nref = "op://Personal/GitHub PAT/credential"\n')
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", return_value=cp), redirect_stdout(out):
+            self.assertEqual(self.module.main(["load", "github_token"]), 0)
+        self.assertEqual(out.getvalue(), "export GITHUB_TOKEN=secret\n")
+
+    def test_load_multiple_names_preserves_input_order(self):
+        self.write_manifest(
+            '[keys.b]\nref = "op://vault/b"\n'
+            '[keys.a]\nref = "op://vault/a"\n'
+            '[keys.c]\nref = "op://vault/c"\n'
+        )
+
+        def fake_run(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, args[-1].split("/")[-1] + "\n", "")
+
+        out = io.StringIO()
+        with patch.object(self.module.subprocess, "run", side_effect=fake_run), redirect_stdout(out):
+            self.assertEqual(self.module.main(["load", "a", "c", "b"]), 0)
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            ["export A=a", "export C=c", "export B=b"],
+        )
+
+    def test_load_unknown_name_lists_known_names(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\n')
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stderr(err):
+            self.module.main(["load", "openai"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("known names: kagi", err.getvalue())
+
+    def test_manifest_lists_entries_and_env_overrides(self):
+        self.write_manifest(
+            '[keys.github_token]\nref = "op://Personal/GitHub PAT/credential"\n\n'
+            '[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "KAGI_KEY"\n'
+        )
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.module.main(["manifest"]), 0)
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [
+                "github_token → op://Personal/GitHub PAT/credential",
+                "kagi → op://Private/kagi.com/api_key → KAGI_KEY",
+            ],
+        )
+
+    def test_manifest_with_empty_manifest_file_prints_manifest_empty(self):
+        self.write_manifest("")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.module.main(["manifest"]), 0)
+        self.assertEqual(out.getvalue().strip(), "manifest empty")
+
+    def test_manifest_with_no_manifest_file_prints_path(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.module.main(["manifest"]), 0)
+        self.assertEqual(out.getvalue().strip(), f"no manifest at {self.manifest_path}")
+
+    def test_malformed_manifest_toml_exits_non_zero_with_parse_error(self):
+        self.write_manifest('[keys.kagi]\nref = "oops"\nunterminated = [\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("parse error", str(ctx.exception))
+        self.assertIn("line 4, column 1", str(ctx.exception))
+
+    def test_invalid_manifest_name_is_rejected(self):
+        self.write_manifest('[keys.Kagi]\nref = "op://Private/kagi.com/api_key"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("invalid key name 'Kagi'", str(ctx.exception))
+
+    def test_invalid_manifest_env_is_rejected(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "kagi_key"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("invalid env 'kagi_key'", str(ctx.exception))
+
+    def test_invalid_manifest_env_starting_with_digit_is_rejected(self):
+        self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\nenv = "1KAGI"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("invalid env '1KAGI'", str(ctx.exception))
+
+    def test_manifest_entry_requires_ref(self):
+        self.write_manifest('[keys.kagi]\nenv = "KAGI_KEY"\n')
+        with self.assertRaises(SystemExit) as ctx:
+            self.module.main(["manifest"])
+        self.assertIn("must define a string 'ref'", str(ctx.exception))
 
     def test_revoke_all_removes_cache_dir(self):
         self.module._save_cached("op://a/b/c", "secret")

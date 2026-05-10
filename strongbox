@@ -7,15 +7,19 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 DEFAULT_TTL_SECONDS = 14400
 DEFAULT_OP_TIMEOUT_SECONDS = 60
 REF_RE = re.compile(r"\{\{\s*(op://[^{}]+?)\s*\}\}|(op://[^\s\"'<>{}]+)")
 REQUIRED_FIELDS = ("ref", "value", "last_used")
+MANIFEST_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
 def now_iso() -> str:
@@ -67,6 +71,16 @@ def _cache_dir_or_none() -> Path | None:
 
 def _resolve_cache_path(ref: str) -> Path:
     return _cache_dir() / f"{_ref_sha(ref)}.json"
+
+
+def _manifest_path() -> Path:
+    override = os.environ.get("STRONGBOX_MANIFEST")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / "strongbox" / "manifest.toml"
+    return Path.home() / ".config" / "strongbox" / "manifest.toml"
 
 
 def _ttl() -> int:
@@ -274,6 +288,76 @@ def _op_read(ref: str) -> str:
     return result.stdout.rstrip("\n")
 
 
+def _load_manifest() -> tuple[dict[str, dict[str, str]], Path, bool]:
+    path = _manifest_path()
+    if not path.exists():
+        return {}, path, False
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except OSError as e:
+        raise SystemExit(f"manifest: cannot read {path}: {e}")
+    except tomllib.TOMLDecodeError as e:
+        detail = str(e)
+        if "line " not in detail:
+            line = text.count("\n") + 1
+            column = len(text.rsplit("\n", 1)[-1]) + 1
+            detail = f"{detail} (at line {line}, column {column})"
+        raise SystemExit(f"manifest: parse error in {path}: {detail}")
+    keys = data.get("keys", {})
+    if not isinstance(keys, dict):
+        raise SystemExit(f"manifest: invalid schema in {path}: 'keys' must be a table")
+    entries: dict[str, dict[str, str]] = {}
+    for name in sorted(keys):
+        entry = keys[name]
+        if not MANIFEST_NAME_RE.fullmatch(name):
+            raise SystemExit(
+                f"manifest: invalid key name {name!r} in {path}; expected [a-z0-9_-]+"
+            )
+        if not isinstance(entry, dict):
+            raise SystemExit(f"manifest: invalid entry for {name!r} in {path}; expected a table")
+        ref = entry.get("ref")
+        if not isinstance(ref, str) or not ref:
+            raise SystemExit(f"manifest: key {name!r} in {path} must define a string 'ref'")
+        env = entry.get("env")
+        if env is not None:
+            if not isinstance(env, str) or not ENV_NAME_RE.fullmatch(env):
+                raise SystemExit(
+                    f"manifest: key {name!r} in {path} has invalid env {env!r}; "
+                    "expected [A-Z_][A-Z0-9_]*"
+                )
+        entries[name] = {"ref": ref, "env": env or name.upper()}
+    return entries, path, True
+
+
+def _known_names(entries: dict[str, dict[str, str]]) -> str:
+    if not entries:
+        return "(none)"
+    return ", ".join(sorted(entries))
+
+
+def _resolve_manifest_name(name: str) -> tuple[str, str]:
+    entries, path, exists = _load_manifest()
+    if not exists:
+        print(f"strongbox: no manifest at {path}", file=sys.stderr)
+        raise SystemExit(2)
+    entry = entries.get(name)
+    if entry is None:
+        print(
+            f"strongbox: unknown manifest name {name!r}; known names: {_known_names(entries)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return entry["ref"], entry["env"]
+
+
+def resolve_name_or_ref(name_or_ref: str) -> str:
+    if name_or_ref.startswith("op://"):
+        return name_or_ref
+    ref, _ = _resolve_manifest_name(name_or_ref)
+    return ref
+
+
 def resolve_ref(ref: str) -> str:
     cached = _load_cached(ref)
     if cached is not None:
@@ -307,6 +391,30 @@ def revoke(ref: str | None = None, all_entries: bool = False) -> int:
         path.unlink()
     except FileNotFoundError:
         pass
+    return 0
+
+
+def load_names(names: list[str]) -> int:
+    for name in names:
+        ref, env = _resolve_manifest_name(name)
+        print(f"export {env}={shlex.quote(resolve_ref(ref))}")
+    return 0
+
+
+def manifest() -> int:
+    entries, path, exists = _load_manifest()
+    if not exists:
+        print(f"no manifest at {path}")
+        return 0
+    if not entries:
+        print("manifest empty")
+        return 0
+    for name in sorted(entries):
+        entry = entries[name]
+        line = f"{name} → {entry['ref']}"
+        if entry["env"] != name.upper():
+            line += f" → {entry['env']}"
+        print(line)
     return 0
 
 
@@ -367,8 +475,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     inject = sub.add_parser("inject", help="resolve op:// refs in a template")
     inject.add_argument("-i", "--input", help="template file path")
-    read = sub.add_parser("read", help="read a single op:// ref")
-    read.add_argument("ref")
+    read = sub.add_parser("read", help="read a single manifest name or op:// ref")
+    read.add_argument("name_or_ref")
+    load = sub.add_parser("load", help="emit shell exports for manifest names")
+    load.add_argument("names", nargs="+")
+    sub.add_parser("manifest", help="list manifest entries")
     stat = sub.add_parser("status", help="show cache state")
     stat.add_argument("ref", nargs="?")
     rev = sub.add_parser("revoke", help="delete one cache entry or all entries")
@@ -390,8 +501,12 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(render_template(template))
         return 0
     if args.command == "read":
-        sys.stdout.write(resolve_ref(args.ref) + "\n")
+        sys.stdout.write(resolve_ref(resolve_name_or_ref(args.name_or_ref)) + "\n")
         return 0
+    if args.command == "load":
+        return load_names(args.names)
+    if args.command == "manifest":
+        return manifest()
     if args.command == "status":
         return status(args.ref)
     if not args.all and not args.ref:
