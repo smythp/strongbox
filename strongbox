@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_TTL_SECONDS = 14400
+DEFAULT_OP_TIMEOUT_SECONDS = 60
+REF_RE = re.compile(r"\{\{\s*(op://[^{}]+?)\s*\}\}|(op://[^\s\"'<>{}]+)")
+REQUIRED_FIELDS = ("ref", "value", "last_used")
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(value: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _find_runtime_base() -> Path | None:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        p = Path(xdg)
+        if p.is_dir() and os.access(p, os.W_OK):
+            return p
+    fallback = Path(f"/run/user/{os.geteuid()}")
+    if fallback.is_dir() and os.access(fallback, os.W_OK):
+        return fallback
+    return None
+
+
+def _cache_dir() -> Path:
+    override = os.environ.get("STRONGBOX_CACHE_DIR")
+    if override:
+        return Path(override)
+    base = _find_runtime_base()
+    if base is None:
+        raise SystemExit(
+            "cache: cannot locate a per-user tmpfs runtime dir.\n"
+            "  attempted: $XDG_RUNTIME_DIR, /run/user/<uid>\n"
+            "  fix: log into a session that sets XDG_RUNTIME_DIR, or set\n"
+            "  STRONGBOX_CACHE_DIR=<path> as an operator escape hatch."
+        )
+    return base / "strongbox"
+
+
+def _ref_sha(ref: str) -> str:
+    return hashlib.sha256(ref.encode("utf-8")).hexdigest()
+
+
+def _cache_dir_or_none() -> Path | None:
+    override = os.environ.get("STRONGBOX_CACHE_DIR")
+    if override:
+        return Path(override)
+    base = _find_runtime_base()
+    return base / "strongbox" if base is not None else None
+
+
+def _resolve_cache_path(ref: str) -> Path:
+    return _cache_dir() / f"{_ref_sha(ref)}.json"
+
+
+def _ttl() -> int:
+    raw = os.environ.get("STRONGBOX_TTL")
+    if raw is None:
+        return DEFAULT_TTL_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_TTL_SECONDS
+    return value if value >= 0 else DEFAULT_TTL_SECONDS
+
+
+def _op_timeout() -> int:
+    raw = os.environ.get("STRONGBOX_OP_TIMEOUT")
+    if raw is None:
+        return DEFAULT_OP_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_OP_TIMEOUT_SECONDS
+    return value if value >= 0 else DEFAULT_OP_TIMEOUT_SECONDS
+
+
+def _ensure_cache_dir(d: Path) -> None:
+    try:
+        d.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"cache: cannot create cache dir {d}: {e}")
+    try:
+        st = d.stat()
+    except OSError as e:
+        raise SystemExit(f"cache: cannot stat cache dir {d}: {e}")
+    if st.st_uid != os.geteuid():
+        raise SystemExit(
+            f"cache: cache dir {d} owned by uid {st.st_uid}, "
+            f"not current user (uid {os.geteuid()}); refusing to use"
+        )
+    mode = st.st_mode & 0o777
+    if mode & 0o077:
+        raise SystemExit(
+            f"cache: cache dir {d} has mode {oct(mode)}; refusing to use.\n"
+            "  required: group/other bits unset (e.g. 0700).\n"
+            f"  fix manually: chmod 700 {d}"
+        )
+
+
+def _atomic_write_cache(path: Path, payload: dict) -> None:
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _touch_last_used(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        data["last_used"] = now_iso()
+        try:
+            _atomic_write_cache(path, data)
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def _read_cache_raw(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    _ensure_cache_dir(path.parent)
+    try:
+        st = path.stat()
+    except OSError as e:
+        print(f"warning: cannot stat cache entry at {path}: {e}", file=sys.stderr)
+        return None
+    mode = st.st_mode & 0o777
+    if mode != 0o600:
+        print(
+            f"warning: cache entry at {path} has mode {oct(mode)} (expected 0600); deleting and re-fetching",
+            file=sys.stderr,
+        )
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    if st.st_uid != os.geteuid():
+        print(
+            f"warning: cache entry at {path} owned by uid {st.st_uid}, not current user (uid {os.geteuid()}); deleting and re-fetching",
+            file=sys.stderr,
+        )
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"warning: cache entry at {path} unreadable ({e}); deleting and re-fetching", file=sys.stderr)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _load_cached(ref: str) -> str | None:
+    path = _resolve_cache_path(ref)
+    data = _read_cache_raw(path)
+    if data is None:
+        return None
+    missing = [field for field in REQUIRED_FIELDS if field not in data]
+    if missing:
+        print(f"warning: cache entry at {path} malformed (missing {missing}); deleting and re-fetching", file=sys.stderr)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    if data.get("ref") != ref:
+        print(
+            f"warning: cache entry at {path} stores ref {data.get('ref')!r}, expected {ref!r}; deleting and re-fetching",
+            file=sys.stderr,
+        )
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    ttl = _ttl()
+    if ttl > 0:
+        try:
+            idle = (dt.datetime.now(dt.timezone.utc) - parse_iso(data["last_used"])).total_seconds()
+        except (TypeError, ValueError):
+            print(f"warning: cache entry at {path} has invalid last_used; deleting and re-fetching", file=sys.stderr)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        if idle > ttl:
+            return None
+    _touch_last_used(path)
+    return data["value"]
+
+
+def _save_cached(ref: str, value: str) -> None:
+    path = _resolve_cache_path(ref)
+    _ensure_cache_dir(path.parent)
+    stamp = now_iso()
+    payload = {"ref": ref, "value": value, "last_used": stamp, "created_at": stamp}
+    try:
+        _atomic_write_cache(path, payload)
+    except OSError as e:
+        print(f"warning: could not cache secret at {path}: {e}", file=sys.stderr)
+
+
+def _op_read(ref: str) -> str:
+    timeout = _op_timeout()
+    try:
+        result = subprocess.run(
+            ["op", "read", ref],
+            capture_output=True,
+            text=True,
+            timeout=None if timeout == 0 else timeout,
+        )
+    except FileNotFoundError:
+        raise SystemExit("strongbox: 'op' (1Password CLI) not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"strongbox: 'op read' timed out after {timeout}s; biometric prompt may be stuck or 1Password is unreachable"
+        )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").rstrip()
+        if stderr:
+            print(stderr, file=sys.stderr)
+        raise SystemExit(result.returncode)
+    return result.stdout.rstrip("\n")
+
+
+def resolve_ref(ref: str) -> str:
+    cached = _load_cached(ref)
+    if cached is not None:
+        return cached
+    value = _op_read(ref)
+    _save_cached(ref, value)
+    return value
+
+
+def render_template(template: str) -> str:
+    memo: dict[str, str] = {}
+
+    def repl(ref: str) -> str:
+        if ref not in memo:
+            memo[ref] = resolve_ref(ref)
+        return memo[ref]
+
+    return REF_RE.sub(lambda m: repl(m.group(1) or m.group(2)), template)
+
+
+def revoke(ref: str | None = None, all_entries: bool = False) -> int:
+    cache_dir = _cache_dir_or_none()
+    if all_entries:
+        if cache_dir is not None and cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        return 0
+    if cache_dir is None:
+        return 0
+    path = _resolve_cache_path(ref)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    return 0
+
+
+def _age(value: object) -> str:
+    if not isinstance(value, str):
+        return "unknown"
+    try:
+        seconds = int((dt.datetime.now(dt.timezone.utc) - parse_iso(value)).total_seconds())
+    except (TypeError, ValueError):
+        return "unknown"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def _status_line(path: Path, data: dict, default_ref: str) -> str:
+    st = path.stat()
+    return f"{data.get('ref', default_ref)} | key={path.stem} | age={_age(data.get('created_at'))} | last_used={_age(data.get('last_used'))} | mode={oct(st.st_mode & 0o777)} | size={st.st_size}"
+
+
+def status(ref: str | None = None) -> int:
+    cache_dir = _cache_dir_or_none()
+    if ref is not None:
+        if cache_dir is None:
+            print(f"not cached: {ref}", file=sys.stderr)
+            return 1
+        path = cache_dir / f"{_ref_sha(ref)}.json"
+        data = _read_cache_raw(path)
+        if data is None:
+            print(f"not cached: {ref}", file=sys.stderr)
+            return 1
+        print(_status_line(path, data, ref))
+        return 0
+    if cache_dir is None:
+        print("cache empty")
+        return 0
+    if not cache_dir.exists():
+        print("cache empty")
+        return 0
+    shown = 0
+    for path in sorted(cache_dir.glob("*.json")):
+        data = _read_cache_raw(path)
+        if data is None:
+            continue
+        print(_status_line(path, data, path.stem))
+        shown += 1
+    if shown == 0:
+        print("cache empty")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="strongbox")
+    sub = parser.add_subparsers(dest="command", required=True)
+    inject = sub.add_parser("inject", help="resolve op:// refs in a template")
+    inject.add_argument("-i", "--input", help="template file path")
+    read = sub.add_parser("read", help="read a single op:// ref")
+    read.add_argument("ref")
+    stat = sub.add_parser("status", help="show cache state")
+    stat.add_argument("ref", nargs="?")
+    rev = sub.add_parser("revoke", help="delete one cache entry or all entries")
+    rev.add_argument("ref", nargs="?")
+    rev.add_argument("--all", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "inject":
+        if args.input:
+            template = Path(args.input).read_text(encoding="utf-8")
+        else:
+            if sys.stdin.isatty():
+                raise SystemExit("strongbox inject: stdin is a tty; pass -i FILE or pipe a template on stdin")
+            template = sys.stdin.read()
+        sys.stdout.write(render_template(template))
+        return 0
+    if args.command == "read":
+        sys.stdout.write(resolve_ref(args.ref) + "\n")
+        return 0
+    if args.command == "status":
+        return status(args.ref)
+    if not args.all and not args.ref:
+        parser.error("strongbox revoke: specify REF or --all")
+    if args.all and args.ref:
+        parser.error("strongbox revoke: REF and --all are mutually exclusive")
+    return revoke(args.ref, args.all)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
