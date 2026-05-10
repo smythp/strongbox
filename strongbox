@@ -57,6 +57,14 @@ def _ref_sha(ref: str) -> str:
     return hashlib.sha256(ref.encode("utf-8")).hexdigest()
 
 
+def _cache_dir_or_none() -> Path | None:
+    override = os.environ.get("STRONGBOX_CACHE_DIR")
+    if override:
+        return Path(override)
+    base = _find_runtime_base()
+    return base / "strongbox" if base is not None else None
+
+
 def _resolve_cache_path(ref: str) -> Path:
     return _cache_dir() / f"{_ref_sha(ref)}.json"
 
@@ -282,10 +290,12 @@ def render_template(template: str) -> str:
 
 
 def revoke(ref: str | None = None, all_entries: bool = False) -> int:
-    cache_dir = _cache_dir()
+    cache_dir = _cache_dir_or_none()
     if all_entries:
-        if cache_dir.exists():
+        if cache_dir is not None and cache_dir.exists():
             shutil.rmtree(cache_dir)
+        return 0
+    if cache_dir is None:
         return 0
     path = _resolve_cache_path(ref or "")
     try:
@@ -317,15 +327,21 @@ def _status_line(path: Path, data: dict, default_ref: str) -> str:
 
 
 def status(ref: str | None = None) -> int:
+    cache_dir = _cache_dir_or_none()
     if ref is not None:
-        path = _resolve_cache_path(ref)
+        if cache_dir is None:
+            print(f"not cached: {ref}", file=sys.stderr)
+            return 1
+        path = cache_dir / f"{_ref_sha(ref)}.json"
         data = _read_cache_raw(path)
         if data is None:
             print(f"not cached: {ref}", file=sys.stderr)
             return 1
         print(_status_line(path, data, ref))
         return 0
-    cache_dir = _cache_dir()
+    if cache_dir is None:
+        print("cache empty")
+        return 0
     if not cache_dir.exists():
         print("cache empty")
         return 0
@@ -375,6 +391,8 @@ def main(argv: list[str] | None = None) -> int:
         return status(args.ref)
     if not args.all and not args.ref:
         parser.error("strongbox revoke: specify REF or --all")
+    if args.command == "revoke" and args.all and args.ref:
+        parser.error("strongbox revoke: REF and --all are mutually exclusive")
     return revoke(args.ref, args.all)
 
 

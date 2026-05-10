@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.helpers import load_strongbox
@@ -41,6 +42,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
         self.assertIn("strongbox revoke: specify REF or --all", err.getvalue())
 
+    def test_revoke_ref_and_all_are_mutually_exclusive(self):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stderr(err):
+            self.module.main(["revoke", "op://a/b/c", "--all"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("strongbox revoke: REF and --all are mutually exclusive", err.getvalue())
+
     def test_inject_with_tty_stdin_refused(self):
         with patch.object(sys.stdin, "isatty", return_value=True):
             with self.assertRaises(SystemExit) as ctx:
@@ -74,3 +82,43 @@ class CliTests(unittest.TestCase):
             str(ctx.exception),
             "strongbox: 'op read' timed out after 60s; biometric prompt may be stuck or 1Password is unreachable",
         )
+
+    def test_revoke_all_removes_cache_dir(self):
+        self.module._save_cached("op://a/b/c", "secret")
+        cache_dir = Path(self.tmp.name)
+        self.assertTrue(any(cache_dir.iterdir()))
+        self.assertEqual(self.module.main(["revoke", "--all"]), 0)
+        self.assertFalse(cache_dir.exists())
+
+    def test_revoke_all_without_runtime_base_is_noop(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(self.module, "_find_runtime_base", return_value=None):
+            self.assertEqual(self.module.main(["revoke", "--all"]), 0)
+
+    def test_status_empty_cache_prints_cache_empty(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.module.main(["status"]), 0)
+        self.assertEqual(out.getvalue().strip(), "cache empty")
+
+    def test_status_lists_cached_entries(self):
+        self.module._save_cached("op://a/b/c", "one")
+        self.module._save_cached("op://d/e/f", "two")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(self.module.main(["status"]), 0)
+        lines = [line for line in out.getvalue().splitlines() if line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("op://a/b/c", lines[0] + lines[1])
+        self.assertIn("op://d/e/f", lines[0] + lines[1])
+
+    def test_status_ref_not_cached_exits_one(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(self.module.main(["status", "op://a/b/c"]), 1)
+        self.assertIn("not cached: op://a/b/c", err.getvalue())
+
+    def test_status_without_runtime_base_treats_cache_as_empty(self):
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch.object(self.module, "_find_runtime_base", return_value=None), redirect_stdout(out):
+            self.assertEqual(self.module.main(["status"]), 0)
+        self.assertEqual(out.getvalue().strip(), "cache empty")
