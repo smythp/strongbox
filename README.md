@@ -50,4 +50,4 @@ strongbox inject -i template.tpl
 
 - `STRONGBOX_TTL`: idle TTL in seconds. Default `14400`. Set `0` to disable expiry.
 - `STRONGBOX_CACHE_DIR`: override the cache directory. By default strongbox uses `$XDG_RUNTIME_DIR/strongbox` or `/run/user/<uid>/strongbox`.
-- `STRONGBOX_OP_TIMEOUT`: timeout in seconds for `op read`. Default `60`.
+- `STRONGBOX_OP_TIMEOUT`: timeout in seconds for `op read`. Default `60`. Set `0` to disable the timeout.

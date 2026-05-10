@@ -18,8 +18,13 @@ class CliTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.module = load_strongbox()
-        self.env = patch.dict(os.environ, {"STRONGBOX_CACHE_DIR": self.tmp.name}, clear=False)
+        self.env = patch.dict(
+            os.environ,
+            {"STRONGBOX_CACHE_DIR": self.tmp.name},
+            clear=False,
+        )
         self.env.start()
+        os.environ.pop("STRONGBOX_OP_TIMEOUT", None)
         self.addCleanup(self.env.stop)
 
     def test_missing_subcommand(self):
@@ -82,6 +87,17 @@ class CliTests(unittest.TestCase):
             str(ctx.exception),
             "strongbox: 'op read' timed out after 60s; biometric prompt may be stuck or 1Password is unreachable",
         )
+
+    def test_op_read_timeout_zero_disables_subprocess_timeout(self):
+        cp = subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        out = io.StringIO()
+        with patch.dict(os.environ, {"STRONGBOX_OP_TIMEOUT": "0"}, clear=False), patch.object(
+            self.module.subprocess,
+            "run",
+            return_value=cp,
+        ) as run_mock, redirect_stdout(out):
+            self.assertEqual(self.module.main(["read", "op://a/b/c"]), 0)
+        self.assertIsNone(run_mock.call_args.kwargs["timeout"])
 
     def test_revoke_all_removes_cache_dir(self):
         self.module._save_cached("op://a/b/c", "secret")
