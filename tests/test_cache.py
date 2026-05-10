@@ -88,6 +88,15 @@ class CacheTests(unittest.TestCase):
         after = json.loads(self.path.read_text())["last_used"]
         self.assertNotEqual(before, after)
 
+    def test_ttl_zero_keeps_cache_hit_despite_old_last_used(self):
+        self.module._save_cached(self.ref, "secret")
+        data = json.loads(self.path.read_text())
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)).replace(microsecond=0)
+        data["last_used"] = old.isoformat().replace("+00:00", "Z")
+        self.path.write_text(json.dumps(data))
+        with patch.dict(os.environ, {"STRONGBOX_TTL": "0"}, clear=False):
+            self.assertEqual(self.module._load_cached(self.ref), "secret")
+
     def test_malformed_json_deleted_and_warned(self):
         self.path.parent.mkdir(mode=0o700, exist_ok=True)
         self.path.write_text("{bad")
@@ -107,3 +116,23 @@ class CacheTests(unittest.TestCase):
             self.assertIsNone(self.module._load_cached(self.ref))
         self.assertIn("missing ['value']", err.getvalue())
         self.assertFalse(self.path.exists())
+
+    def test_ref_mismatch_deleted_and_warned(self):
+        other_ref = "op://vault/other/field"
+        self.path.parent.mkdir(mode=0o700, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"ref": other_ref, "value": "secret", "last_used": self.module.now_iso()})
+        )
+        self.path.chmod(0o600)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertIsNone(self.module._load_cached(self.ref))
+        self.assertIn(f"stores ref '{other_ref}', expected '{self.ref}'", err.getvalue())
+        self.assertFalse(self.path.exists())
+
+    def test_resolve_ref_uses_cache_after_first_read(self):
+        cp = self.module.subprocess.CompletedProcess(["op", "read"], 0, "secret\n", "")
+        with patch.object(self.module.subprocess, "run", return_value=cp) as mock_run:
+            self.assertEqual(self.module.resolve_ref(self.ref), "secret")
+            self.assertEqual(self.module.resolve_ref(self.ref), "secret")
+        self.assertEqual(mock_run.call_count, 1)

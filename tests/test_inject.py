@@ -36,6 +36,16 @@ class InjectTests(unittest.TestCase):
         self.assertEqual(out, "secret and secret and secret")
         self.assertEqual(mock_resolve.call_count, 1)
 
+    def test_resolved_value_containing_op_ref_is_not_reprocessed(self):
+        refs = {
+            "op://a/b/c": "literal op://d/e/f",
+            "op://d/e/f": "second",
+        }
+        with patch.object(self.module, "resolve_ref", side_effect=lambda ref: refs[ref]) as mock_resolve:
+            out = self.module.render_template("{{ op://a/b/c }}")
+        self.assertEqual(out, "literal op://d/e/f")
+        self.assertEqual(mock_resolve.call_args_list, [(("op://a/b/c",), {})])
+
     def test_non_ref_lookalikes_not_matched(self):
         with patch.object(self.module, "resolve_ref", return_value="secret"):
             self.assertEqual(self.module.render_template("https://op.example/foo"), "https://op.example/foo")

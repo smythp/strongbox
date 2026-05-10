@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
 DEFAULT_TTL_SECONDS = 14400
-BARE_REF_RE = re.compile(r"op://[^\s\"'<>{}]+")
-BRACED_REF_RE = re.compile(r"\{\{\s*(op://[^{}]+?)\s*\}\}")
+DEFAULT_OP_TIMEOUT_SECONDS = 60
+REF_RE = re.compile(r"\{\{\s*(op://[^{}]+?)\s*\}\}|(op://[^\s\"'<>{}]+)")
 REQUIRED_FIELDS = ("ref", "value", "last_used")
 
 
@@ -56,9 +57,8 @@ def _ref_sha(ref: str) -> str:
     return hashlib.sha256(ref.encode("utf-8")).hexdigest()
 
 
-def _resolve_cache_path(ref_or_sha: str) -> Path:
-    key = ref_or_sha if re.fullmatch(r"[0-9a-f]{64}", ref_or_sha) else _ref_sha(ref_or_sha)
-    return _cache_dir() / f"{key}.json"
+def _resolve_cache_path(ref: str) -> Path:
+    return _cache_dir() / f"{_ref_sha(ref)}.json"
 
 
 def _ttl() -> int:
@@ -70,6 +70,17 @@ def _ttl() -> int:
     except ValueError:
         return DEFAULT_TTL_SECONDS
     return value if value >= 0 else DEFAULT_TTL_SECONDS
+
+
+def _op_timeout() -> int:
+    raw = os.environ.get("STRONGBOX_OP_TIMEOUT")
+    if raw is None:
+        return DEFAULT_OP_TIMEOUT_SECONDS
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_OP_TIMEOUT_SECONDS
+    return value if value >= 0 else DEFAULT_OP_TIMEOUT_SECONDS
 
 
 def _ensure_cache_dir(d: Path) -> None:
@@ -187,8 +198,18 @@ def _load_cached(ref: str) -> str | None:
     if data is None:
         return None
     missing = [field for field in REQUIRED_FIELDS if field not in data]
-    if missing or data.get("ref") != ref:
-        print(f"warning: cache entry at {path} malformed (missing {missing or 'matching ref'}); deleting and re-fetching", file=sys.stderr)
+    if missing:
+        print(f"warning: cache entry at {path} malformed (missing {missing}); deleting and re-fetching", file=sys.stderr)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+    if data.get("ref") != ref:
+        print(
+            f"warning: cache entry at {path} stores ref {data.get('ref')!r}, expected {ref!r}; deleting and re-fetching",
+            file=sys.stderr,
+        )
         try:
             path.unlink()
         except OSError:
@@ -223,10 +244,15 @@ def _save_cached(ref: str, value: str) -> None:
 
 
 def _op_read(ref: str) -> str:
+    timeout = _op_timeout()
     try:
-        result = subprocess.run(["op", "read", ref], capture_output=True, text=True)
+        result = subprocess.run(["op", "read", ref], capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
         raise SystemExit("strongbox: 'op' (1Password CLI) not found on PATH")
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"strongbox: 'op read' timed out after {timeout}s; biometric prompt may be stuck or 1Password is unreachable"
+        )
     if result.returncode != 0:
         stderr = (result.stderr or "").rstrip()
         if stderr:
@@ -252,8 +278,7 @@ def render_template(template: str) -> str:
             memo[ref] = resolve_ref(ref)
         return memo[ref]
 
-    text = BRACED_REF_RE.sub(lambda m: repl(m.group(1)), template)
-    return BARE_REF_RE.sub(lambda m: repl(m.group(0)), text)
+    return REF_RE.sub(lambda m: repl(m.group(1) or m.group(2)), template)
 
 
 def revoke(ref: str | None = None, all_entries: bool = False) -> int:

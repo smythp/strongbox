@@ -61,3 +61,16 @@ class CliTests(unittest.TestCase):
                 self.module.main(["read", "op://a/b/c"])
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("denied", err.getvalue())
+
+    def test_op_read_timeout_exits_with_clear_message(self):
+        with patch.object(
+            self.module.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["op", "read"], timeout=60),
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                self.module.main(["read", "op://a/b/c"])
+        self.assertEqual(
+            str(ctx.exception),
+            "strongbox: 'op read' timed out after 60s; biometric prompt may be stuck or 1Password is unreachable",
+        )
