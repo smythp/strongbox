@@ -186,6 +186,22 @@ class CliTests(unittest.TestCase):
             ["export A=a", "export C=c", "export B=b"],
         )
 
+    def test_load_partial_failure_emits_no_stdout_and_loads_manifest_once(self):
+        self.write_manifest(
+            '[keys.a]\nref = "op://vault/a"\n'
+            '[keys.c]\nref = "op://vault/c"\n'
+        )
+        out = io.StringIO()
+        err = io.StringIO()
+        load_manifest = self.module._load_manifest
+        with patch.object(self.module, "_load_manifest", wraps=load_manifest) as load_manifest_mock:
+            with self.assertRaises(SystemExit) as ctx, redirect_stdout(out), redirect_stderr(err):
+                self.module.main(["load", "a", "unknown_b", "c"])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("unknown manifest names: 'unknown_b'", err.getvalue())
+        self.assertEqual(load_manifest_mock.call_count, 1)
+
     def test_load_unknown_name_lists_known_names(self):
         self.write_manifest('[keys.kagi]\nref = "op://Private/kagi.com/api_key"\n')
         err = io.StringIO()

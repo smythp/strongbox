@@ -336,8 +336,14 @@ def _known_names(entries: dict[str, dict[str, str]]) -> str:
     return ", ".join(sorted(entries))
 
 
-def _resolve_manifest_name(name: str) -> tuple[str, str]:
-    entries, path, exists = _load_manifest()
+def _resolve_manifest_name(
+    name: str, entries: dict[str, dict[str, str | bool]] | None = None
+) -> tuple[str, str]:
+    if entries is None:
+        entries, path, exists = _load_manifest()
+    else:
+        path = _manifest_path()
+        exists = True
     if not exists:
         print(f"strongbox: no manifest at {path}", file=sys.stderr)
         raise SystemExit(2)
@@ -348,7 +354,7 @@ def _resolve_manifest_name(name: str) -> tuple[str, str]:
             file=sys.stderr,
         )
         raise SystemExit(2)
-    return entry["ref"], entry["env"]
+    return str(entry["ref"]), str(entry["env"])
 
 
 def resolve_name_or_ref(name_or_ref: str) -> str:
@@ -395,8 +401,20 @@ def revoke(ref: str | None = None, all_entries: bool = False) -> int:
 
 
 def load_names(names: list[str]) -> int:
+    entries, path, exists = _load_manifest()
+    if not exists:
+        print(f"strongbox: no manifest at {path}", file=sys.stderr)
+        raise SystemExit(2)
+    unknown = [name for name in names if name not in entries]
+    if unknown:
+        print(
+            f"strongbox: unknown manifest names: {', '.join(repr(name) for name in unknown)}; "
+            f"known names: {_known_names(entries)}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     for name in names:
-        ref, env = _resolve_manifest_name(name)
+        ref, env = _resolve_manifest_name(name, entries)
         print(f"export {env}={shlex.quote(resolve_ref(ref))}")
     return 0
 
